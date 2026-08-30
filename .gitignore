@@ -1,0 +1,17 @@
+.DS_Store
+.notes-cli.conf
+.env
+.env.*
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.pem
+*.key
+*.p12
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+dist/
+*.zip

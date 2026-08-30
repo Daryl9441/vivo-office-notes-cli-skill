@@ -1,0 +1,790 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLI_VERSION="1.0.0-macfix.2"
+MIN_API_VERSION="v1"
+
+# ---------- config ----------
+CONFIG_FILE="${HOME}/.notes-cli.conf"
+NOTES_PORT="${NOTES_PORT:-}"
+NOTES_TOKEN="${NOTES_TOKEN:-}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  while IFS= read -r config_line || [[ -n "${config_line:-}" ]]; do
+    case "${config_line:-}" in
+      NOTES_PORT=*) NOTES_PORT="${config_line#NOTES_PORT=}" ;;
+      NOTES_TOKEN=*) NOTES_TOKEN="${config_line#NOTES_TOKEN=}" ;;
+    esac
+  done < "$CONFIG_FILE"
+fi
+
+NOTES_PORT="${NOTES_PORT:-9200}"
+NOTES_TOKEN="${NOTES_TOKEN:-}"
+
+BASE_URL="http://127.0.0.1:${NOTES_PORT}/third-party"
+HEALTH_URL="http://127.0.0.1:${NOTES_PORT}/health"
+
+# ---------- helpers ----------
+http_get() {
+  local url="$1"
+  if [[ -n "${NOTES_TOKEN:-}" ]]; then
+    curl -sS --connect-timeout 5 --max-time 30 -w "\n%{http_code}" \
+      -H "Authorization: Bearer ${NOTES_TOKEN}" "$url"
+  else
+    curl -sS --connect-timeout 5 --max-time 30 -w "\n%{http_code}" "$url"
+  fi
+}
+
+http_post() {
+  local url="$1" body="$2"
+  if [[ -n "${NOTES_TOKEN:-}" ]]; then
+    curl -sS -X POST --connect-timeout 5 --max-time 30 \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer ${NOTES_TOKEN}" \
+      -w "\n%{http_code}" \
+      -d "$body" "$url"
+  else
+    curl -sS -X POST --connect-timeout 5 --max-time 30 \
+      -H "Content-Type: application/json" \
+      -w "\n%{http_code}" \
+      -d "$body" "$url"
+  fi
+}
+
+http_put() {
+  local url="$1" body="$2"
+  if [[ -n "${NOTES_TOKEN:-}" ]]; then
+    curl -sS -X PUT --connect-timeout 5 --max-time 30 \
+      -H "Content-Type: application/json" \
+      -H "Authorization: Bearer ${NOTES_TOKEN}" \
+      -w "\n%{http_code}" \
+      -d "$body" "$url"
+  else
+    curl -sS -X PUT --connect-timeout 5 --max-time 30 \
+      -H "Content-Type: application/json" \
+      -w "\n%{http_code}" \
+      -d "$body" "$url"
+  fi
+}
+
+strip_http_code() {
+  sed '$d' <<< "$1"
+}
+
+check_auth_error() {
+  local resp="$1"
+  local http_code
+  http_code=$(echo "$resp" | tail -1)
+  if [[ "$http_code" == "401" ]]; then
+    echo "Error: Authentication failed (401 Unauthorized)"
+    echo "Please check if the Token is valid or expired. Reconfigure with:"
+    echo "  notes config --token=<new-token>"
+    return 0
+  fi
+  return 1
+}
+
+print_response_error() {
+  local resp="$1"
+  check_auth_error "$resp" && exit 1
+  local body
+  body=$(strip_http_code "$resp")
+  echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(f\"Error: {d.get('error',{}).get('code','unknown')} - {d.get('error',{}).get('message','')}\")" 2>/dev/null || echo "$body"
+  exit 1
+}
+
+urlencode() {
+  local raw="$1"
+  python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1]))" "$raw" 2>/dev/null || \
+  python -c "import urllib, sys; print(urllib.quote(sys.argv[1]))" "$raw" 2>/dev/null || \
+  echo "$raw"
+}
+
+# ---------- commands ----------
+cmd_health() {
+  local resp
+  resp=$(http_get "${HEALTH_URL}" 2>&1) || {
+    echo "Error: Cannot connect to ${BASE_URL}"
+    echo "Please check if Office Suite is running."
+    exit 1
+  }
+  local body
+  body=$(strip_http_code "$resp")
+  local port
+  port=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('port','unknown'))" 2>/dev/null || echo "unknown")
+  echo "Server is running at ${BASE_URL} (port ${port})"
+}
+
+cmd_version() {
+  local resp body
+  resp=$(http_get "${BASE_URL}/version" 2>&1) || {
+    echo "Error: Cannot connect to ${BASE_URL}"
+    echo "Please check if Office Suite is running."
+    exit 1
+  }
+  body=$(strip_http_code "$resp")
+  local status
+  status=$(echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+  if [[ "$status" != "success" ]]; then
+    print_response_error "$resp"
+    return
+  fi
+  local app_version api_version
+  app_version=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('data',{}).get('appVersion','unknown'))" 2>/dev/null || echo "unknown")
+  api_version=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('data',{}).get('apiVersion','unknown'))" 2>/dev/null || echo "unknown")
+  echo "${app_version} (api: ${api_version})"
+}
+
+cmd_list() {
+  local folder="" limit="20" page="1" json_flag=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --folder=*) folder=$(urlencode "${1#*=}") ;;
+      --limit=*) limit="${1#*=}" ;;
+      --page=*) page="${1#*=}" ;;
+      --json) json_flag="1" ;;
+      *) shift; continue ;;
+    esac
+    shift
+  done
+
+  local params="limit=${limit}&page=${page}"
+  [[ -n "$folder" ]] && params="${params}&folder=${folder}"
+
+  local resp body
+  resp=$(http_get "${BASE_URL}/notes?${params}")
+  body=$(strip_http_code "$resp")
+  if [[ -n "$json_flag" ]]; then
+    echo "$body"
+    return
+  fi
+
+  local status
+  status=$(echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+  if [[ "$status" != "success" ]]; then
+    print_response_error "$resp"
+    return
+  fi
+
+  echo "$body" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+data = d.get('data', [])
+meta = d.get('meta', {})
+for i, note in enumerate(data, 1):
+    print(f\"{i}. [{note['id']}] {note['title']}  ({note['folder']})\")
+print('---')
+print(f\"Total: {meta.get('total', len(data))} notes\")
+"
+}
+
+cmd_read() {
+  if [[ $# -eq 0 ]]; then
+    echo "Error: note id is required"
+    exit 1
+  fi
+  local id="$1" json_flag=""
+  [[ "$#" -gt 1 && "$2" == "--json" ]] && json_flag="1"
+
+  local resp body
+  resp=$(http_get "${BASE_URL}/notes/${id}")
+  body=$(strip_http_code "$resp")
+  if [[ -n "$json_flag" ]]; then
+    echo "$body"
+    return
+  fi
+
+  local status
+  status=$(echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+  if [[ "$status" != "success" ]]; then
+    print_response_error "$resp"
+    return
+  fi
+
+  echo "$body" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)['data']
+print(f\"ID: {d['id']}\")
+print(f\"Title: {d['title']}\")
+print(f\"Folder: {d['folder']}\")
+print(f\"Created: {d.get('created','')}\")
+print(f\"Updated: {d.get('updated','')}\")
+print('---')
+print(d.get('content',''))
+"
+}
+
+cmd_create() {
+  local title="" content="" content_b64="" folder="" json_flag=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title=*) title="${1#*=}" ;;
+      --content=*) content="${1#*=}" ;;
+      --content-b64=*) content_b64="${1#*=}" ;;
+      --folder=*) folder="${1#*=}" ;;
+      --json) json_flag="1" ;;
+      *) shift; continue ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$title" ]]; then
+    echo "Error: --title is required"
+    exit 1
+  fi
+
+  local body
+  body=$(TITLE="$title" CONTENT="$content" CONTENT_B64="$content_b64" FOLDER="$folder" python3 -c '
+import json, os, sys, base64
+obj = {"title": os.environ.get("TITLE", "")}
+c = os.environ.get("CONTENT", "")
+if not c:
+    b = os.environ.get("CONTENT_B64", "")
+    if b:
+        c = base64.b64decode(b).decode("utf-8")
+if c: obj["content"] = c
+f = os.environ.get("FOLDER", "")
+if f: obj["folder"] = f
+print(json.dumps(obj, ensure_ascii=False))
+')
+
+  local resp resp_body
+  resp=$(http_post "${BASE_URL}/notes" "$body")
+  resp_body=$(strip_http_code "$resp")
+  if [[ -n "$json_flag" ]]; then
+    echo "$resp_body"
+    return
+  fi
+
+  local status
+  status=$(echo "$resp_body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+  if [[ "$status" != "success" ]]; then
+    print_response_error "$resp"
+    return
+  fi
+
+  echo "$resp_body" | python3 -c "import json,sys; d=json.load(sys.stdin)['data']; print(f\"Created: {d['id']} - {d['title']}\")"
+}
+
+cmd_update() {
+  if [[ $# -eq 0 ]]; then
+    echo "Error: note id is required"
+    exit 1
+  fi
+  local id="$1"; shift
+  local title="" content="" content_b64="" folder="" json_flag=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title=*) title="${1#*=}" ;;
+      --content=*) content="${1#*=}" ;;
+      --content-b64=*) content_b64="${1#*=}" ;;
+      --folder=*) folder="${1#*=}" ;;
+      --json) json_flag="1" ;;
+      *) shift; continue ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$id" ]]; then
+    echo "Error: note id is required"
+    exit 1
+  fi
+
+  local body
+  body=$(TITLE="$title" CONTENT="$content" CONTENT_B64="$content_b64" FOLDER="$folder" python3 -c '
+import json, os, sys, base64
+obj = {}
+t = os.environ.get("TITLE", "")
+if t: obj["title"] = t
+c = os.environ.get("CONTENT", "")
+if not c:
+    b = os.environ.get("CONTENT_B64", "")
+    if b:
+        c = base64.b64decode(b).decode("utf-8")
+if c: obj["content"] = c
+f = os.environ.get("FOLDER", "")
+if f: obj["folder"] = f
+print(json.dumps(obj, ensure_ascii=False))
+')
+
+  local resp resp_body
+  resp=$(http_put "${BASE_URL}/notes/${id}" "$body")
+  resp_body=$(strip_http_code "$resp")
+  if [[ -n "$json_flag" ]]; then
+    echo "$resp_body"
+    return
+  fi
+
+  local status
+  status=$(echo "$resp_body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+  if [[ "$status" != "success" ]]; then
+    print_response_error "$resp"
+    return
+  fi
+
+  echo "$resp_body" | python3 -c "import json,sys; d=json.load(sys.stdin)['data']; print(f\"Updated: {d['id']} - {d['title']}\")"
+}
+
+cmd_search() {
+  local query="" limit="10" folder="" json_flag=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --query=*) query=$(urlencode "${1#*=}") ;;
+      --limit=*) limit="${1#*=}" ;;
+      --folder=*) folder=$(urlencode "${1#*=}") ;;
+      --json) json_flag="1" ;;
+      *) shift; continue ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$query" ]]; then
+    echo "Error: --query is required"
+    exit 1
+  fi
+
+  local params="query=${query}&limit=${limit}"
+  [[ -n "$folder" ]] && params="${params}&folder=${folder}"
+
+  local resp body
+  resp=$(http_get "${BASE_URL}/notes/search?${params}")
+  body=$(strip_http_code "$resp")
+  if [[ -n "$json_flag" ]]; then
+    echo "$body"
+    return
+  fi
+
+  local status
+  status=$(echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+  if [[ "$status" != "success" ]]; then
+    print_response_error "$resp"
+    return
+  fi
+
+  echo "$body" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+data = d.get('data', [])
+meta = d.get('meta', {})
+print(f\"Search: \\\"{meta.get('query','')}\\\"\")
+print('---')
+for i, note in enumerate(data, 1):
+    print(f\"{i}. [{note['id']}] {note['title']}  ({note['folder']})\")
+    if note.get('snippet'):
+        print(f\"  {note['snippet']}\")
+print(f\"Total: {meta.get('total', len(data))} results\")
+"
+}
+
+cmd_folders() {
+  local parent="" json_flag=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --parent=*) parent=$(urlencode "${1#*=}") ;;
+      --json) json_flag="1" ;;
+      *) shift; continue ;;
+    esac
+    shift
+  done
+
+  local params=""
+  [[ -n "$parent" ]] && params="parent=${parent}"
+
+  local url="${BASE_URL}/folders"
+  [[ -n "$params" ]] && url="${url}?${params}"
+
+  local resp body
+  resp=$(http_get "$url")
+  body=$(strip_http_code "$resp")
+  if [[ -n "$json_flag" ]]; then
+    echo "$body"
+    return
+  fi
+
+  local status
+  status=$(echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+  if [[ "$status" != "success" ]]; then
+    print_response_error "$resp"
+    return
+  fi
+
+  echo "$body" | python3 -c "
+import json, sys
+data = json.load(sys.stdin).get('data', [])
+for i, f in enumerate(data, 1):
+    parent = f.get('parent_id')
+    parent_str = 'root' if parent is None else f'→ {parent}'
+    print(f\"{i}. [{f['id']}] {f['name']}  ({parent_str}, {f.get('note_count',0)} notes)\")
+print('---')
+print(f\"Total: {len(data)} folders\")
+"
+}
+
+cmd_folder() {
+  if [[ $# -eq 0 ]]; then
+    echo "Error: folder id is required"
+    exit 1
+  fi
+  local id="$1" json_flag=""
+  [[ "$#" -gt 1 && "$2" == "--json" ]] && json_flag="1"
+
+  local resp body
+  resp=$(http_get "${BASE_URL}/folders/${id}")
+  body=$(strip_http_code "$resp")
+  if [[ -n "$json_flag" ]]; then
+    echo "$body"
+    return
+  fi
+
+  local status
+  status=$(echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+  if [[ "$status" != "success" ]]; then
+    print_response_error "$resp"
+    return
+  fi
+
+  echo "$body" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)['data']
+parent = d.get('parent_id')
+parent_str = 'root' if parent is None else parent
+print(f\"ID: {d['id']}\")
+print(f\"Name: {d['name']}\")
+print(f\"Parent folder: {parent_str}\")
+print(f\"Notes: {d.get('note_count',0)} (direct)\")
+"
+}
+
+cmd_folder_create() {
+  local name="" parent="" json_flag=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name=*) name="${1#*=}" ;;
+      --parent=*) parent="${1#*=}" ;;
+      --json) json_flag="1" ;;
+      *) shift; continue ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$name" ]]; then
+    echo "Error: --name is required"
+    exit 1
+  fi
+
+  local body
+  body=$(NAME="$name" PARENT="$parent" python3 -c '
+import json, os, sys
+obj = {"name": os.environ.get("NAME", "")}
+p = os.environ.get("PARENT", "")
+if p: obj["parent_id"] = p
+print(json.dumps(obj, ensure_ascii=False))
+')
+
+  local resp resp_body
+  resp=$(http_post "${BASE_URL}/folders" "$body")
+  resp_body=$(strip_http_code "$resp")
+  if [[ -n "$json_flag" ]]; then
+    echo "$resp_body"
+    return
+  fi
+
+  local status
+  status=$(echo "$resp_body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+  if [[ "$status" != "success" ]]; then
+    print_response_error "$resp"
+    return
+  fi
+
+  echo "$resp_body" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)['data']
+parent = d.get('parent_id')
+parent_str = 'root' if parent is None else f'→ {parent}'
+print(f\"Created: {d['id']} - {d['name']} ({parent_str})\")
+"
+}
+
+cmd_folder_update() {
+  if [[ $# -eq 0 ]]; then
+    echo "Error: folder id is required"
+    exit 1
+  fi
+  local id="$1"; shift
+  local name="" parent="" json_flag=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --name=*) name="${1#*=}" ;;
+      --parent=*) parent="${1#*=}" ;;
+      --json) json_flag="1" ;;
+      *) shift; continue ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$id" ]]; then
+    echo "Error: folder id is required"
+    exit 1
+  fi
+
+  local body
+  body=$(NAME="$name" PARENT="$parent" python3 -c '
+import json, os, sys
+obj = {}
+n = os.environ.get("NAME", "")
+if n: obj["name"] = n
+p = os.environ.get("PARENT", "")
+if p: obj["parent_id"] = p
+print(json.dumps(obj, ensure_ascii=False))
+')
+
+  local resp resp_body
+  resp=$(http_put "${BASE_URL}/folders/${id}" "$body")
+  resp_body=$(strip_http_code "$resp")
+  if [[ -n "$json_flag" ]]; then
+    echo "$resp_body"
+    return
+  fi
+
+  local status
+  status=$(echo "$resp_body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+  if [[ "$status" != "success" ]]; then
+    print_response_error "$resp"
+    return
+  fi
+
+  echo "$resp_body" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)['data']
+parent = d.get('parent_id')
+parent_str = 'root' if parent is None else f'→ {parent}'
+print(f\"Updated: {d['id']} - {d['name']} ({parent_str})\")
+"
+}
+
+cmd_folder_notes() {
+  if [[ $# -eq 0 ]]; then
+    echo "Error: folder id is required"
+    exit 1
+  fi
+  local id="$1"; shift
+  local limit="20" page="1" json_flag=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --limit=*) limit="${1#*=}" ;;
+      --page=*) page="${1#*=}" ;;
+      --json) json_flag="1" ;;
+      *) shift; continue ;;
+    esac
+    shift
+  done
+
+  if [[ -z "$id" ]]; then
+    echo "Error: folder id is required"
+    exit 1
+  fi
+
+  local resp body
+  resp=$(http_get "${BASE_URL}/folders/${id}/notes?limit=${limit}&page=${page}")
+  body=$(strip_http_code "$resp")
+  if [[ -n "$json_flag" ]]; then
+    echo "$body"
+    return
+  fi
+
+  local status
+  status=$(echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+  if [[ "$status" != "success" ]]; then
+    print_response_error "$resp"
+    return
+  fi
+
+  echo "$body" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+data = d.get('data', [])
+meta = d.get('meta', {})
+for i, note in enumerate(data, 1):
+    print(f\"{i}. [{note['id']}] {note['title']}  ({note['folder']})\")
+print('---')
+total = meta.get('total', len(data))
+page = meta.get('page', 1)
+page_size = meta.get('page_size', len(data))
+total_pages = -(-total // page_size) if page_size > 0 else 1
+print(f\"Total: {total} (page {page}/{total_pages})\")
+"
+}
+
+# ---------- cli:check ----------
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+default_codex_root="${CODEX_HOME:-${HOME}/.codex}"
+if [[ -f "${SCRIPT_DIR}/../SKILL.md" ]]; then
+  CLI_SKILL_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+elif [[ -f "${default_codex_root}/skills/office-suite-notes/SKILL.md" ]]; then
+  CLI_SKILL_DIR="${default_codex_root}/skills/office-suite-notes"
+elif [[ -f "/Applications/pcsuite.app/Contents/Resources/skills/office-suite-notes/SKILL.md" ]]; then
+  CLI_SKILL_DIR="/Applications/pcsuite.app/Contents/Resources/skills/office-suite-notes"
+else
+  CLI_SKILL_DIR="${SCRIPT_DIR}"
+fi
+
+get_local_skill_version() {
+  local skill_file="${CLI_SKILL_DIR}/SKILL.md"
+  if [[ ! -f "$skill_file" ]]; then
+    echo "unknown"
+    return
+  fi
+  python3 -c "
+import re, sys
+try:
+    content = open(sys.argv[1], encoding='utf-8').read()
+    m = re.search(r'^\s*version:\s*[\"\']?([\w.\-]+)[\"\']?', content, re.MULTILINE)
+    print(m.group(1) if m else 'unknown')
+except Exception:
+    print('unknown')
+" "$skill_file"
+}
+
+cmd_cli_check() {
+  local resp body status
+  resp=$(http_get "${BASE_URL}/cli/version" 2>&1) || {
+    echo "Error: Cannot connect to ${BASE_URL}"
+    echo "Please check if Office Suite is running."
+    exit 1
+  }
+  body=$(strip_http_code "$resp")
+  status=$(echo "$body" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('status',''))" 2>/dev/null || true)
+  if [[ "$status" != "success" ]]; then
+    print_response_error "$resp"
+    return
+  fi
+
+  local local_skill
+  local_skill=$(get_local_skill_version)
+  local remote_skill upgrade_prompt
+  remote_skill=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('data',{}).get('skill_version','unknown'))" 2>/dev/null || echo "unknown")
+  upgrade_prompt=$(echo "$body" | python3 -c "import json,sys; print(json.load(sys.stdin).get('data',{}).get('upgrade_prompt',''))" 2>/dev/null || echo "")
+
+  echo "Current version:"
+  echo "  Skill: ${local_skill}"
+  echo "  Path:  ${CLI_SKILL_DIR}/SKILL.md"
+  echo "Latest version:"
+  echo "  Skill: ${remote_skill}"
+  if [[ -n "$upgrade_prompt" ]]; then
+    echo "Upgrade prompt:"
+    echo "${upgrade_prompt}"
+  fi
+  echo "---"
+
+  if [[ "$local_skill" != "$remote_skill" ]]; then
+    echo "Status: update available"
+  else
+    echo "Status: up to date"
+  fi
+}
+
+cmd_config() {
+  local token="" port="" show_only=1
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --token=*) token="${1#*=}"; show_only="" ;;
+      --port=*) port="${1#*=}"; show_only="" ;;
+      *) shift; continue ;;
+    esac
+    shift
+  done
+
+  if [[ -n "$show_only" ]]; then
+    echo "Current config:"
+    if [[ -n "${NOTES_TOKEN:-}" ]]; then
+      echo "  Token: configured"
+    else
+      echo "  Token: not configured"
+    fi
+    echo "  Port:  ${NOTES_PORT}"
+    echo "  Config file: ${CONFIG_FILE}"
+    return
+  fi
+
+  if [[ -n "$port" && ! "$port" =~ ^[0-9]+$ ]]; then
+    echo "Error: --port must be an integer"
+    exit 1
+  fi
+  if [[ -n "$port" && ( "$port" -lt 9200 || "$port" -gt 9700 ) ]]; then
+    echo "Error: --port must be between 9200 and 9700"
+    exit 1
+  fi
+  if [[ "$token" == *$'\n'* || "$token" == *$'\r'* ]]; then
+    echo "Error: token must not contain line breaks"
+    exit 1
+  fi
+
+  local effective_token="${token:-${NOTES_TOKEN:-}}"
+  local effective_port="${port:-${NOTES_PORT:-9200}}"
+  mkdir -p "$(dirname "$CONFIG_FILE")"
+  umask 077
+  {
+    printf 'NOTES_TOKEN=%s\n' "$effective_token"
+    printf 'NOTES_PORT=%s\n' "$effective_port"
+  } > "$CONFIG_FILE"
+  chmod 600 "$CONFIG_FILE"
+
+  echo "Config saved to ${CONFIG_FILE} (permissions 600)"
+  echo "Current config:"
+  if [[ -n "$effective_token" ]]; then
+    echo "  Token: configured"
+  else
+    echo "  Token: not configured"
+  fi
+  echo "  Port:  ${effective_port}"
+  echo ""
+  echo "Subsequent commands will read this config automatically."
+}
+
+# ---------- main ----------
+usage() {
+  echo "Notes CLI v${CLI_VERSION}"
+  echo ""
+  echo "Usage: notes <command> [options]"
+  echo ""
+  echo "Commands:"
+  echo "  health                  Check server connectivity"
+  echo "  version                 Show App version"
+  echo "  list    [--folder=] [--limit=20] [--page=1] [--json]"
+  echo "  read    <id> [--json]"
+  echo "  create  --title= [--content=] [--content-b64=] [--folder=] [--json]"
+  echo "  update  <id> [--title=] [--content=] [--content-b64=] [--folder=] [--json]"
+  echo "  search  --query= [--limit=10] [--folder=] [--json]"
+  echo "  folders [--parent=] [--json]"
+  echo "  folder  <id> [--json]"
+  echo "  folder:create  --name= [--parent=] [--json]"
+  echo "  folder:update  <id> [--name=] [--parent=] [--json]"
+  echo "  folder:notes   <id> [--limit=20] [--page=1] [--json]"
+  echo "  config  [--token=] [--port=]"
+  echo "  cli:check                 Check CLI/Skill update"
+  echo ""
+  echo "For JSON output, add --json to any command."
+}
+
+if [[ $# -eq 0 ]]; then
+  usage
+  exit 0
+fi
+
+case "$1" in
+  health) shift; cmd_health "$@" ;;
+  version) shift; cmd_version "$@" ;;
+  list) shift; cmd_list "$@" ;;
+  read) shift; cmd_read "$@" ;;
+  create) shift; cmd_create "$@" ;;
+  update) shift; cmd_update "$@" ;;
+  search) shift; cmd_search "$@" ;;
+  folders) shift; cmd_folders "$@" ;;
+  folder) shift; cmd_folder "$@" ;;
+  folder:create) shift; cmd_folder_create "$@" ;;
+  folder:update) shift; cmd_folder_update "$@" ;;
+  folder:notes) shift; cmd_folder_notes "$@" ;;
+  config) shift; cmd_config "$@" ;;
+  cli:check) shift; cmd_cli_check "$@" ;;
+  -h|--help|help) usage ;;
+  *) echo "Unknown command: $1"; usage; exit 1 ;;
+esac

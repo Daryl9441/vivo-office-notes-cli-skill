@@ -1,0 +1,4 @@
+interface:
+  display_name: "vivo 原子笔记 CLI"
+  short_description: "通过官方本地 CLI 安全读写 vivo 原子笔记"
+  default_prompt: "Use $office-suite-notes to search my vivo 原子笔记 and summarize the matching notes."
